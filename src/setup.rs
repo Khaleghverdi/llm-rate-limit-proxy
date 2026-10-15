@@ -89,10 +89,11 @@ pub async fn setup_submit(
             name: form.provider_name.clone(),
             base_url: config::normalize_base_url(&form.base_url),
             protocol: form.protocol.unwrap_or_default(),
+            window_secs: None,
             keys: vec![config::ProviderKey {
                 key: form.api_key.clone(),
                 enabled: true,
-                rpm: 40,
+                requests_per_window: 40,
                 owner: form.username.clone(),
             }],
         });
@@ -108,11 +109,8 @@ pub async fn setup_submit(
     state.setup_required.store(false, Ordering::Relaxed);
 
     // Rebuild the live pool so the just-added provider key is usable immediately.
-    let specs = crate::pool::lane_specs(&state.store.lock().unwrap());
-    *state.pool.write().unwrap() = Arc::new(crate::pool::Pool::for_provider_window(
-        specs,
-        state.provider_window,
-    ));
+    let specs = crate::pool::lane_specs(&state.store.lock().unwrap(), state.provider_window);
+    *state.pool.write().unwrap() = Arc::new(crate::pool::Pool::new(specs));
 
     Html(format!(
         "<!doctype html><meta charset=utf-8><title>LLM Rate Limit Proxy — Ready</title>\

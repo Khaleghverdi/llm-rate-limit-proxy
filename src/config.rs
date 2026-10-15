@@ -87,6 +87,10 @@ pub struct Provider {
     /// written before this field existed loads unchanged.
     #[serde(default)]
     pub protocol: Protocol,
+    /// Configured rolling window in seconds for this provider. Absent means the
+    /// existing global/environment default is inherited.
+    #[serde(default)]
+    pub window_secs: Option<u64>,
 }
 
 /// The request shape an upstream expects, and that a client sends.
@@ -125,8 +129,12 @@ pub struct ProviderKey {
     pub key: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
-    #[serde(default = "default_rpm")]
-    pub rpm: usize,
+    #[serde(
+        default = "default_requests_per_window",
+        rename = "requests_per_window",
+        alias = "rpm"
+    )]
+    pub requests_per_window: usize,
     #[serde(default)]
     pub owner: String,
 }
@@ -135,7 +143,7 @@ fn default_true() -> bool {
     true
 }
 
-fn default_rpm() -> usize {
+fn default_requests_per_window() -> usize {
     40
 }
 
@@ -315,10 +323,11 @@ mod tests {
                 name: "nim".into(),
                 base_url: "https://example.test".into(),
                 protocol: Default::default(),
+                window_secs: None,
                 keys: vec![ProviderKey {
                     key: "k".into(),
                     enabled: true,
-                    rpm: 40,
+                    requests_per_window: 40,
                     owner: "admin".into(),
                 }],
             }],
@@ -372,6 +381,26 @@ mod tests {
     #[test]
     fn superuser_found() {
         assert_eq!(sample().superuser().unwrap().username, "admin");
+    }
+
+    #[test]
+    fn legacy_rpm_loads_as_requests_per_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = r#"{
+  "version": 1,
+  "providers": [{"name":"p","base_url":"https://x","keys":[{"key":"k","enabled":true,"rpm":7}]}]
+}"#;
+        std::fs::write(store_path(dir.path()), raw).unwrap();
+        let sc = load(dir.path()).unwrap().unwrap();
+        assert_eq!(sc.providers[0].keys[0].requests_per_window, 7);
+    }
+
+    #[test]
+    fn both_rpm_names_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = r#"{"version":1,"providers":[{"name":"p","base_url":"https://x","keys":[{"key":"k","enabled":true,"rpm":7,"requests_per_window":9}]}]}"#;
+        std::fs::write(store_path(dir.path()), raw).unwrap();
+        assert!(load(dir.path()).is_err());
     }
 }
 

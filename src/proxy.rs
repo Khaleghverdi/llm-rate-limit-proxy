@@ -234,18 +234,31 @@ const DEFAULT_BENCH: Duration = Duration::from_secs(5);
 /// Take the rebuffed lane out of rotation for as long as the provider asked, or
 /// a short default. A key that just answered 429 will answer the same way to the
 /// next request, so without this every request pays to rediscover it.
-fn bench_lane(state: &AppState, lane_idx: usize, model: &str, status: u16, headers: &HeaderMap) {
+fn bench_lane(
+    state: &AppState,
+    provider: &str,
+    key: &str,
+    model: &str,
+    status: u16,
+    headers: &HeaderMap,
+) {
     let cooldown = retry_after(headers).unwrap_or(DEFAULT_BENCH);
     let pool = state.pool.read().unwrap().clone();
-    if let Some(lane) = pool.lanes().get(lane_idx) {
+    if let Some(lane) = pool
+        .lanes()
+        .iter()
+        .find(|lane| lane.provider == provider && lane.key == key)
+    {
         lane.bench(Instant::now() + cooldown);
         state.metrics.record_event("lane_benched");
         // Retries are invisible in the access log, which only records how a
         // request finally ended. Without this line an operator can see that the
         // governor engaged but has no way to count the pushback behind it.
         println!(
-            "  retry {status} {} key#{lane_idx} {model} (benched {}s)",
+            "  retry {status} {} {} key#{} {model} (benched {}s)",
             lane.provider,
+            key,
+            key,
             cooldown.as_secs()
         );
     }
@@ -672,7 +685,7 @@ pub async fn handle(
     let offering = state.catalog.providers_offering(&model_label);
     let plan = resolve_plan(requested.as_deref(), &aliases, pool_len, &offering);
     let last = plan.len().saturating_sub(1);
-    let mut excluded: Vec<usize> = Vec::new();
+    let mut excluded: Vec<(String, String)> = Vec::new();
     for (i, step) in plan.iter().enumerate() {
         let is_last = i == last;
         // Model pressure is gated before the rate slot: a request that cannot run
@@ -731,16 +744,25 @@ pub async fn handle(
                     // but the next one shouldn't walk into the same wall.
                     bench_lane(
                         &state,
-                        permit.lane_idx,
+                        &permit.provider,
+                        &permit.key,
                         step_model,
                         resp.status().as_u16(),
                         resp.headers(),
                     );
+                    let governor_lane = state
+                        .pool
+                        .read()
+                        .unwrap()
+                        .lanes()
+                        .iter()
+                        .position(|lane| lane.provider == permit.provider && lane.key == permit.key)
+                        .unwrap_or(permit.lane_idx);
                     state
                         .governor
-                        .note_rebuff(step_model, permit.lane_idx, Instant::now());
+                        .note_rebuff(step_model, governor_lane, Instant::now());
                     if !is_last {
-                        excluded.push(permit.lane_idx);
+                        excluded.push((permit.provider.clone(), permit.key.clone()));
                         continue;
                     }
                 }
@@ -776,7 +798,7 @@ pub async fn handle(
             }
             Err(e) => {
                 if !is_last {
-                    excluded.push(permit.lane_idx);
+                    excluded.push((permit.provider.clone(), permit.key.clone()));
                     continue;
                 }
                 record(
@@ -981,7 +1003,7 @@ fn sse_error(code: &str) -> Result<Bytes, std::io::Error> {
 async fn acquire_for_heartbeating(
     state: &Arc<AppState>,
     provider: Option<&str>,
-    excluded: &[usize],
+    excluded: &[(String, String)],
     session: Option<u64>,
     wire: Protocol,
     deadline: Option<Instant>,
@@ -1048,7 +1070,7 @@ async fn stream_proxy(
     let offering = state.catalog.providers_offering(&model);
     let plan = resolve_plan(requested.as_deref(), &aliases, pool_len, &offering);
     let last = plan.len().saturating_sub(1);
-    let mut excluded: Vec<usize> = Vec::new();
+    let mut excluded: Vec<(String, String)> = Vec::new();
     let mut retried_plain = false;
     for (i, step) in plan.iter().enumerate() {
         let is_last = i == last;
@@ -1129,16 +1151,25 @@ async fn stream_proxy(
                 if is_retryable(resp.status().as_u16()) {
                     bench_lane(
                         &state,
-                        permit.lane_idx,
+                        &permit.provider,
+                        &permit.key,
                         step_model,
                         resp.status().as_u16(),
                         resp.headers(),
                     );
+                    let governor_lane = state
+                        .pool
+                        .read()
+                        .unwrap()
+                        .lanes()
+                        .iter()
+                        .position(|lane| lane.provider == permit.provider && lane.key == permit.key)
+                        .unwrap_or(permit.lane_idx);
                     state
                         .governor
-                        .note_rebuff(step_model, permit.lane_idx, Instant::now());
+                        .note_rebuff(step_model, governor_lane, Instant::now());
                     if !is_last {
-                        excluded.push(permit.lane_idx);
+                        excluded.push((permit.provider.clone(), permit.key.clone()));
                         continue;
                     }
                 }
@@ -1163,7 +1194,7 @@ async fn stream_proxy(
             }
             Err(_) => {
                 if !is_last {
-                    excluded.push(permit.lane_idx);
+                    excluded.push((permit.provider.clone(), permit.key.clone()));
                     continue;
                 }
                 record(

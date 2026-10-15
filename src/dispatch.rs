@@ -31,6 +31,11 @@ impl Dispatcher {
         }
     }
 
+    /// Hold the FIFO gate while rebuilding/publishing a replacement pool.
+    pub async fn hold(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.gate.lock().await
+    }
+
     /// Acquire any rate slot, blocking until one is available. Convenience for
     /// callers that don't care which provider or lane serves them.
     pub async fn acquire(&self) -> Permit {
@@ -46,7 +51,7 @@ impl Dispatcher {
     pub async fn acquire_for(
         &self,
         provider: Option<&str>,
-        exclude: &[usize],
+        exclude: &[(String, String)],
         session: Option<u64>,
         protocol: Option<Protocol>,
     ) -> Option<Permit> {
@@ -64,7 +69,9 @@ impl Dispatcher {
                 // OpenAI upstream earns a 400 no matter which key serves it.
                 if provider.is_some_and(|p| lane.provider != p)
                     || protocol.is_some_and(|w| lane.protocol != w)
-                    || exclude.contains(&idx)
+                    || exclude
+                        .iter()
+                        .any(|x| x == &(lane.provider.clone(), lane.key.clone()))
                 {
                     continue;
                 }
@@ -77,7 +84,7 @@ impl Dispatcher {
                     continue;
                 }
                 let load = lane.load(now);
-                if load < lane.rpm {
+                if load < lane.requests_per_window {
                     with_room.push((load, idx));
                 } else if let Err(retry_at) = lane.try_acquire(now) {
                     // A saturated lane records nothing, so this only reads its clock.
@@ -121,12 +128,13 @@ mod tests {
     use crate::pool::{LaneSpec, Pool};
     use std::sync::{Arc, RwLock};
 
-    fn spec(name: &str, rpm: usize) -> LaneSpec {
+    fn spec(name: &str, requests_per_window: usize) -> LaneSpec {
         LaneSpec {
             provider: name.into(),
             base_url: format!("http://{name}.test"),
             key: format!("{name}-key"),
-            rpm,
+            requests_per_window,
+            window: Duration::from_secs(61),
             protocol: Default::default(),
         }
     }

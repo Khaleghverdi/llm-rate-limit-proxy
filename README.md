@@ -229,8 +229,27 @@ To keep it running after you close the terminal, register it with Task Scheduler
 **From source:**
 
 ```sh
-cargo run --release
+cargo fmt --check
+cargo test
+cargo test --test load -- --ignored
+cargo clippy --all-targets --all-features -- -D warnings
+cargo build --release
 ```
+
+The optimized binary is built at `target/release/llm-rate-limit-proxy` (on the
+tested Rust versions, about 4 MB). The binary starts listening on
+`127.0.0.1:8000` by default and writes `DATA_DIR/config.json`, `usage.json`,
+and `history.jsonl` in the configured data directory.
+
+For a user-local install:
+
+```sh
+install -m 0755 target/release/llm-rate-limit-proxy ~/.local/bin/llm-rate-limit-proxy
+```
+
+System installation under `/usr/local/bin` or as an enabled systemd service
+requires elevated permissions; use the project's `install.sh` or your site's
+service manager. Do not delete an existing `DATA_DIR` while upgrading.
 
 Images are published on every push to `master` as `:edge`, and on a version tag
 as `:1.2.3`, `:1.2` and `:latest`. `:edge` is whatever just landed; tags are the
@@ -247,9 +266,64 @@ capability.
 | `HOST` / `PORT` | `127.0.0.1` / `8000` | Bind address. Loopback by default — this process holds every provider key and terminates no TLS, so set `HOST=0.0.0.0` only behind a reverse proxy |
 | `DATA_DIR` | `data` | Where the config store and history live |
 | `TRUST_PROXY` | `false` | Trust `X-Forwarded-Proto`; marks the session cookie `Secure` |
+| `LLM_RATE_LIMIT_PROXY_PROVIDER_WINDOW_MS` | `60000` | Fallback rolling window in milliseconds for providers without an explicit `window_secs`; existing per-key rate limits are enforced over this plus `JITTER_MARGIN` |
 
 Everything else is managed in Settings and applies live. Until setup completes
 the data plane is closed and browsers are sent to the wizard.
+
+### Rate limiting per provider
+
+Each upstream API key is a "lane" with its own exact rolling-window limiter:
+
+```json
+{
+  "name": "provider-a",
+  "base_url": "https://example.test",
+  "protocol": "openai",
+  "window_secs": 7,
+  "keys": [
+    {
+      "key": "sk-...",
+      "enabled": true,
+      "requests_per_window": 1,
+      "owner": "admin"
+    }
+  ]
+}
+```
+
+The policy per key is `requests_per_window` requests per rolling `window_secs`
+seconds. `window_secs` is configured per provider and inherited by every key
+belonging to that provider. A missing `window_secs` inherits the global fallback
+environment setting, `LLM_RATE_LIMIT_PROXY_PROVIDER_WINDOW_MS` (default 60000
+milliseconds).
+
+The proxy adds a fixed one-second `JITTER_MARGIN`, so the effective enforcement
+window is always slightly longer than the configured provider window. This is
+deliberate and remains unchanged: for `window_secs = 7`, dispatching the next
+request waits for the prior request to be outside the effective window.
+
+When a request receives a retryable upstream 429, the lane records upstream
+cooldown information separately from the normal rate window. Rate limiting runs
+during successful operation; cooldown and `Retry-After` only alter when a benched
+lane is eligible again. These mechanisms are not conflated.
+
+Validation limits:
+- `requests_per_window`: 1 to 10000
+- `window_secs`, when present: 1 to 86400 seconds
+- `Retry-After`: honored up to 60 seconds, otherwise the default cooldown is 5 seconds
+
+Historical configurations used `rpm`. On load, `rpm` is accepted as a legacy
+name for `requests_per_window`. New saves serialize only `requests_per_window`.
+
+### Management API and dashboard
+
+- `POST /api/settings/providers {"action":"add",...,"requests_per_window":1,"window_secs":7}`
+- `POST /api/settings/providers {"action":"set_window_secs","name":"provider-a","window_secs":14}`
+- `POST /api/settings/provider-keys {"action":"add","provider":"provider-a","key":"...","requests_per_window":5}`
+
+The settings view returns `window_secs` per provider and
+`requests_per_window` per key.
 
 ## Operations
 

@@ -74,21 +74,21 @@ pub struct Lane {
     pub provider: String,
     pub base_url: String,
     pub key: String,
-    pub rpm: usize,
+    pub requests_per_window: usize,
     pub protocol: Protocol,
     limiter: Mutex<SlidingWindow>,
     cooldown_until: Mutex<Option<Instant>>,
 }
 
 impl Lane {
-    fn new(spec: LaneSpec, window: Duration) -> Self {
+    fn new(spec: LaneSpec) -> Self {
         Self {
-            limiter: Mutex::new(SlidingWindow::new(spec.rpm, window)),
+            limiter: Mutex::new(SlidingWindow::new(spec.requests_per_window, spec.window)),
             cooldown_until: Mutex::new(None),
             provider: spec.provider,
             base_url: spec.base_url,
             key: spec.key,
-            rpm: spec.rpm,
+            requests_per_window: spec.requests_per_window,
             protocol: spec.protocol,
         }
     }
@@ -142,21 +142,24 @@ pub struct LaneSpec {
     pub provider: String,
     pub base_url: String,
     pub key: String,
-    pub rpm: usize,
+    pub requests_per_window: usize,
+    pub window: Duration,
     pub protocol: Protocol,
 }
 
-/// Flatten every enabled, non-zero-rpm key across all providers into lane specs.
-pub fn lane_specs(sc: &StoredConfig) -> Vec<LaneSpec> {
+/// Flatten every enabled key with a positive limit across all providers into lane specs.
+pub fn lane_specs(sc: &StoredConfig, default_window: Duration) -> Vec<LaneSpec> {
     let mut specs = Vec::new();
     for p in &sc.providers {
         for k in &p.keys {
-            if k.enabled && k.rpm > 0 {
+            if k.enabled && k.requests_per_window > 0 {
+                let configured = p.window_secs.unwrap_or(default_window.as_secs().max(1));
                 specs.push(LaneSpec {
                     provider: p.name.clone(),
                     base_url: p.base_url.clone(),
                     key: k.key.clone(),
-                    rpm: k.rpm,
+                    requests_per_window: k.requests_per_window,
+                    window: Duration::from_secs(configured.max(1)) + JITTER_MARGIN,
                     protocol: p.protocol,
                 });
             }
@@ -167,26 +170,40 @@ pub fn lane_specs(sc: &StoredConfig) -> Vec<LaneSpec> {
 
 pub struct Pool {
     lanes: Vec<Lane>,
-    window: Duration,
 }
 
 impl Pool {
     pub fn new(specs: Vec<LaneSpec>) -> Self {
-        Self::for_provider_window(specs, PROVIDER_WINDOW)
-    }
-
-    /// Build lanes that enforce over the provider window *plus* the jitter margin,
-    /// keeping the proxy strictly under the provider's real per-key limit.
-    pub fn for_provider_window(specs: Vec<LaneSpec>, provider_window: Duration) -> Self {
-        Self::with_window(specs, provider_window + JITTER_MARGIN)
-    }
-
-    /// Build with an exact enforcement window (no margin) — tests use this to
-    /// exercise pacing without waiting a real minute.
-    pub fn with_window(specs: Vec<LaneSpec>, window: Duration) -> Self {
         Self {
-            lanes: specs.into_iter().map(|s| Lane::new(s, window)).collect(),
-            window,
+            lanes: specs.into_iter().map(Lane::new).collect(),
+        }
+    }
+
+    /// Build lanes with an exact enforcement window. This is mainly useful for tests.
+    pub fn with_window(specs: Vec<LaneSpec>, window: Duration) -> Self {
+        let specs: Vec<LaneSpec> = specs
+            .into_iter()
+            .map(|mut s| {
+                s.window = window;
+                s
+            })
+            .collect();
+        Self {
+            lanes: specs.into_iter().map(Lane::new).collect(),
+        }
+    }
+
+    /// Compatibility helper for configs that intentionally use one fallback window.
+    pub fn for_provider_window(specs: Vec<LaneSpec>, provider_window: Duration) -> Self {
+        let specs: Vec<LaneSpec> = specs
+            .into_iter()
+            .map(|mut s| {
+                s.window = provider_window + JITTER_MARGIN;
+                s
+            })
+            .collect();
+        Self {
+            lanes: specs.into_iter().map(Lane::new).collect(),
         }
     }
 
@@ -202,7 +219,7 @@ impl Pool {
         let lanes: Vec<Lane> = specs
             .into_iter()
             .map(|spec| {
-                let lane = Lane::new(spec, self.window);
+                let lane = Lane::new(spec);
                 if let Some(old) = self
                     .lanes
                     .iter()
@@ -213,10 +230,7 @@ impl Pool {
                 lane
             })
             .collect();
-        Self {
-            lanes,
-            window: self.window,
-        }
+        Self { lanes }
     }
 
     pub fn len(&self) -> usize {
@@ -227,13 +241,13 @@ impl Pool {
         self.lanes.is_empty()
     }
 
-    /// Aggregate requests-per-minute the whole pool can sustain.
+    /// Aggregate configured requests-per-window across all current lanes.
     pub fn capacity_rpm(&self) -> usize {
-        self.lanes.iter().map(|l| l.rpm).sum()
+        self.lanes.iter().map(|l| l.requests_per_window).sum()
     }
 
     pub fn rpms(&self) -> Vec<usize> {
-        self.lanes.iter().map(|l| l.rpm).collect()
+        self.lanes.iter().map(|l| l.requests_per_window).collect()
     }
 
     pub fn lanes(&self) -> &[Lane] {
@@ -306,10 +320,11 @@ mod tests {
             name: name.into(),
             base_url: format!("http://{name}.test"),
             protocol: Default::default(),
+            window_secs: None,
             keys: vec![ProviderKey {
                 key: format!("{name}-key"),
                 enabled,
-                rpm,
+                requests_per_window: rpm,
                 owner: "admin".into(),
             }],
         }
@@ -325,7 +340,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let pool = Pool::new(lane_specs(&sc));
+        let pool = Pool::new(lane_specs(&sc, PROVIDER_WINDOW));
         assert_eq!(pool.len(), 2);
         assert_eq!(pool.capacity_rpm(), 60);
         assert_eq!(pool.rpms(), vec![40, 20]);
@@ -337,7 +352,7 @@ mod tests {
             providers: vec![provider("nim", 40, true)],
             ..Default::default()
         };
-        let pool = Pool::new(lane_specs(&sc));
+        let pool = Pool::new(lane_specs(&sc, PROVIDER_WINDOW));
         let lane = &pool.lanes()[0];
         assert_eq!(lane.base_url, "http://nim.test");
         assert_eq!(lane.key, "nim-key");
@@ -350,7 +365,8 @@ mod tests {
                 provider: "nim".into(),
                 base_url: "http://nim.test".into(),
                 key: format!("key-{i}"),
-                rpm: 40,
+                requests_per_window: 40,
+                window: Duration::from_secs(61),
                 protocol: Default::default(),
             })
             .collect()

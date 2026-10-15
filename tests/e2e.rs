@@ -156,17 +156,18 @@ async fn fails_over_from_bad_key_to_good_key() {
             name: "mock".into(),
             base_url: mock.clone(),
             protocol: Default::default(),
+            window_secs: None,
             keys: vec![
                 ProviderKey {
                     key: "bad-key".into(),
                     enabled: true,
-                    rpm: 40,
+                    requests_per_window: 40,
                     owner: "admin".into(),
                 },
                 ProviderKey {
                     key: "good-key".into(),
                     enabled: true,
-                    rpm: 40,
+                    requests_per_window: 40,
                     owner: "admin".into(),
                 },
             ],
@@ -225,11 +226,12 @@ async fn a_conversation_keeps_one_key_as_its_transcript_grows() {
             name: "mock".into(),
             base_url: mock.clone(),
             protocol: Default::default(),
+            window_secs: None,
             keys: (0..4)
                 .map(|i| ProviderKey {
                     key: format!("key-{i}"),
                     enabled: true,
-                    rpm: 40,
+                    requests_per_window: 40,
                     owner: "admin".into(),
                 })
                 .collect(),
@@ -285,12 +287,13 @@ async fn a_rate_limited_key_is_benched_so_the_next_request_skips_it() {
             name: "mock".into(),
             base_url: mock.clone(),
             protocol: Default::default(),
+            window_secs: None,
             keys: ["sick-key", "healthy-key"]
                 .iter()
                 .map(|k| ProviderKey {
                     key: (*k).into(),
                     enabled: true,
-                    rpm: 40,
+                    requests_per_window: 40,
                     owner: "admin".into(),
                 })
                 .collect(),
@@ -342,10 +345,11 @@ async fn requests_past_the_concurrency_cap_are_shed_with_retry_after() {
             name: "mock".into(),
             base_url: mock.clone(),
             protocol: Default::default(),
+            window_secs: None,
             keys: vec![ProviderKey {
                 key: "k".into(),
                 enabled: true,
-                rpm: 40,
+                requests_per_window: 40,
                 owner: "admin".into(),
             }],
         }],
@@ -413,11 +417,12 @@ async fn pressure_on_a_model_is_detected_across_keys_and_reported() {
             name: "mock".into(),
             base_url: mock.clone(),
             protocol: Default::default(),
+            window_secs: None,
             keys: (0..4)
                 .map(|i| ProviderKey {
                     key: format!("key-{i}"),
                     enabled: true,
-                    rpm: 40,
+                    requests_per_window: 40,
                     owner: "admin".into(),
                 })
                 .collect(),
@@ -471,10 +476,11 @@ async fn the_catalog_is_cached_and_lists_aliases_alongside_real_models() {
             name: "mock".into(),
             base_url: mock.clone(),
             protocol: Default::default(),
+            window_secs: None,
             keys: vec![ProviderKey {
                 key: "k".into(),
                 enabled: true,
-                rpm: 40,
+                requests_per_window: 40,
                 owner: "admin".into(),
             }],
         }],
@@ -649,7 +655,7 @@ async fn adding_a_provider_key_raises_capacity_without_a_restart() {
     let r = settings_post(
         &s,
         "/api/settings/provider-keys",
-        serde_json::json!({"action": "add", "provider": "mock", "key": "second-key", "rpm": 25}),
+        serde_json::json!({"action": "add", "provider": "mock", "key": "second-key", "requests_per_window": 25}),
     )
     .await;
     assert_eq!(r.status(), 200);
@@ -997,10 +1003,11 @@ async fn virtual_model_falls_back_across_providers() {
                 name: "pa".into(),
                 base_url: mock_a,
                 protocol: Default::default(),
+                window_secs: None,
                 keys: vec![ProviderKey {
                     key: "pa-key".into(),
                     enabled: true,
-                    rpm: 40,
+                    requests_per_window: 40,
                     owner: "admin".into(),
                 }],
             },
@@ -1008,10 +1015,11 @@ async fn virtual_model_falls_back_across_providers() {
                 name: "pb".into(),
                 base_url: mock_b,
                 protocol: Default::default(),
+                window_secs: None,
                 keys: vec![ProviderKey {
                     key: "pb-key".into(),
                     enabled: true,
-                    rpm: 40,
+                    requests_per_window: 40,
                     owner: "admin".into(),
                 }],
             },
@@ -1181,7 +1189,7 @@ async fn a_plain_user_cannot_change_server_configuration() {
     for (path, body) in [
         (
             "/api/settings/provider-keys",
-            serde_json::json!({"action": "add", "provider": "main", "key": "stolen", "rpm": 40}),
+            serde_json::json!({"action": "add", "provider": "main", "key": "stolen", "requests_per_window": 40}),
         ),
         (
             "/api/settings/providers",
@@ -1564,10 +1572,11 @@ async fn a_source_allowlist_refuses_everyone_else_but_never_loopback() {
             name: "mock".into(),
             base_url: mock.clone(),
             protocol: Default::default(),
+            window_secs: None,
             keys: vec![ProviderKey {
                 key: "k".into(),
                 enabled: true,
-                rpm: 40,
+                requests_per_window: 40,
                 owner: "admin".into(),
             }],
         }],
@@ -1667,7 +1676,7 @@ async fn anthropic_and_openai(anthropic_url: &str, openai_url: &str) -> (Server,
     let key = |k: &str| ProviderKey {
         key: k.into(),
         enabled: true,
-        rpm: 40,
+        requests_per_window: 40,
         owner: "admin".into(),
     };
     let store = StoredConfig {
@@ -1686,12 +1695,14 @@ async fn anthropic_and_openai(anthropic_url: &str, openai_url: &str) -> (Server,
                 name: "openai".into(),
                 base_url: openai_url.to_string(),
                 protocol: Protocol::OpenAi,
+                window_secs: None,
                 keys: vec![key("sk-openai-secret")],
             },
             Provider {
                 name: "anthropic".into(),
                 base_url: anthropic_url.to_string(),
                 protocol: Protocol::Anthropic,
+                window_secs: None,
                 keys: vec![key("sk-ant-secret")],
             },
         ],
@@ -1926,10 +1937,11 @@ async fn an_anthropic_request_is_refused_when_no_anthropic_provider_exists() {
             name: "openai".into(),
             base_url: openai.clone(),
             protocol: Protocol::OpenAi,
+            window_secs: None,
             keys: vec![ProviderKey {
                 key: "sk-openai-secret".into(),
                 enabled: true,
-                rpm: 40,
+                requests_per_window: 40,
                 owner: "admin".into(),
             }],
         }],

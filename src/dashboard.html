@@ -201,7 +201,7 @@
     <div class="strip" id="strip">
       <div>status<b class="live" id="s-live">live</b></div>
       <div>lanes<b id="s-lanes">–</b></div>
-      <div>capacity<b id="s-cap">–</b><span class="tag">rpm</span></div>
+      <div>capacity<b id="s-cap">–</b><span class="tag">R</span></div>
       <div>uptime<b id="s-up">–</b></div>
       <div>build<b id="s-ver">–</b></div>
       <div id="s-pressure-wrap" class="hidden">held back<b id="s-pressure" style="color:var(--warn,#e0a030)">–</b></div>
@@ -390,7 +390,8 @@
           <option value="openai">openai</option>
           <option value="anthropic">anthropic</option>
         </select>
-        <input name="rpm" type="number" value="40" min="1" max="10000" size="5" title="requests per minute">
+        <input name="requests_per_window" type="number" value="40" min="1" max="10000" size="5" title="requests per provider window">
+        <input name="window_secs" type="number" value="60" min="1" max="86400" size="5" title="rolling window seconds">
         <button type="submit">add provider</button>
       </form>
     </div>
@@ -401,7 +402,7 @@
       <form class="row" data-post="/api/settings/provider-keys" data-action="add">
         <input name="provider" placeholder="provider" size="10" required>
         <input name="key" placeholder="api key" size="34" required>
-        <input name="rpm" type="number" value="40" min="1" max="10000" size="5">
+        <input name="requests_per_window" type="number" value="40" min="1" max="10000" size="5">
         <button type="submit">add key</button>
       </form>
     </div>
@@ -633,7 +634,7 @@
   }
   function renderCapacity() {
     $("c-lanes").textContent = cfg.lanes ?? "–";
-    $("c-cap").innerHTML = nfmt(cfg.capacity_rpm) + "<small> rpm</small>";
+    $("c-cap").innerHTML = nfmt(cfg.capacity_rpm) + "<small> configured</small>";
     $("c-win").innerHTML = (cfg.provider_window_secs ?? "–") + "<small> s</small>";
     const lanes = [...(stats.lanes || [])].sort((a, b) => b.requests - a.requests);
     const max = Math.max(1, ...lanes.map((l) => l.requests));
@@ -641,7 +642,7 @@
       <span class="lbl">${esc(l.provider)}</span><span class="val">${nfmt(l.requests)} req</span>
       <div class="meter"><i style="width:${(l.requests / max * 100).toFixed(1)}%"></i></div></div>`).join("")
       : `<div class="empty">No lane traffic yet</div>`;
-    $("lanes-note").textContent = cfg.rpms ? "per-key ceilings: " + cfg.rpms.join(" / ") + " rpm" : "";
+    $("lanes-note").textContent = cfg.rpms ? "per-key ceilings: " + cfg.rpms.join(" / ") + " R" : "";
     renderPressure();
   }
 
@@ -753,15 +754,16 @@
     const provs = cfg2.providers || [];
     fill("cfg-providers", provs.length ? table(provs.map((p) => [
       p.name, p.base_url, p.protocol || "openai",
+      p.window_secs != null ? `${p.window_secs}s` : "default",
       `${p.keys.length} key${p.keys.length === 1 ? "" : "s"}`,
       actionBtn("remove", true, () => act("/api/settings/providers",
         { action: "remove", name: p.name }, `provider ${p.name} removed`)),
-    ]), ["provider", "base url", "protocol", "keys", ""]) : null, "no providers configured");
+    ]), ["provider", "base url", "protocol", "window", "keys", ""]) : null, "no providers configured");
 
     const keyRows = [];
     for (const p of provs) {
       p.keys.forEach((k, i) => keyRows.push([
-        p.name, "…" + k.last4, String(k.rpm), k.enabled ? "enabled" : "disabled",
+        p.name, "…" + k.last4, String(k.requests_per_window ?? k.rpm), k.enabled ? "enabled" : "disabled",
         actionBtn(k.enabled ? "disable" : "enable", k.enabled, () =>
           act("/api/settings/provider-keys",
               { action: "update", provider: p.name, index: i, enabled: !k.enabled },

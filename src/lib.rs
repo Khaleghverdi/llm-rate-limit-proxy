@@ -311,9 +311,8 @@ pub async fn run() {
         .parse::<u64>()
         .map(Duration::from_millis)
         .unwrap_or(pool::PROVIDER_WINDOW);
-    let pool: pool::PoolHandle = Arc::new(RwLock::new(Arc::new(pool::Pool::for_provider_window(
-        pool::lane_specs(&stored),
-        provider_window,
+    let pool: pool::PoolHandle = Arc::new(RwLock::new(Arc::new(pool::Pool::new(
+        pool::lane_specs(&stored, provider_window),
     ))));
     let http = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))

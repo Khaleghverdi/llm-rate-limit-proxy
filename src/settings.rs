@@ -48,10 +48,14 @@ fn bad_request(message: &str) -> Response {
 /// The store lock is released before the pool swap so a save never holds two
 /// locks at once, and the rebuild carries rate state so this is safe to call
 /// while requests are in flight.
-fn apply(state: &Arc<AppState>) -> Result<(), String> {
+async fn apply(state: &Arc<AppState>) -> Result<(), String> {
+    let _gate = state.dispatch.hold().await;
     let (specs, snapshot) = {
         let store = state.store.lock().unwrap();
-        (pool::lane_specs(&store), store.clone())
+        (
+            pool::lane_specs(&store, state.provider_window),
+            store.clone(),
+        )
     };
     config::save(&state.data_dir, &snapshot)?;
     let rebuilt = {
@@ -80,10 +84,11 @@ pub async fn view(
             "name": p.name,
             "base_url": p.base_url,
             "protocol": p.protocol,
+            "window_secs": p.window_secs,
             "keys": p.keys.iter().map(|k| json!({
                 "last4": last4(&k.key),
                 "enabled": k.enabled,
-                "rpm": k.rpm,
+                "requests_per_window": k.requests_per_window,
                 "owner": k.owner,
             })).collect::<Vec<_>>(),
         })).collect::<Vec<_>>(),
@@ -116,7 +121,8 @@ pub enum KeyAction {
     Add {
         provider: String,
         key: String,
-        rpm: Option<usize>,
+        #[serde(alias = "rpm")]
+        requests_per_window: Option<usize>,
     },
     Remove {
         provider: String,
@@ -126,7 +132,8 @@ pub enum KeyAction {
         provider: String,
         index: usize,
         enabled: Option<bool>,
-        rpm: Option<usize>,
+        #[serde(alias = "rpm")]
+        requests_per_window: Option<usize>,
     },
 }
 
@@ -147,7 +154,11 @@ pub async fn provider_keys(
         };
 
         match action {
-            KeyAction::Add { key, rpm, .. } => {
+            KeyAction::Add {
+                key,
+                requests_per_window,
+                ..
+            } => {
                 let key = key.trim().to_string();
                 if key.is_empty() {
                     return bad_request("key must not be empty");
@@ -155,14 +166,14 @@ pub async fn provider_keys(
                 if p.keys.iter().any(|k| k.key == key) {
                     return bad_request("that key is already in the pool");
                 }
-                let rpm = rpm.unwrap_or(40);
-                if let Err(e) = check_rpm(rpm) {
+                let requests_per_window = requests_per_window.unwrap_or(40);
+                if let Err(e) = check_requests_per_window(requests_per_window) {
                     return bad_request(&e);
                 }
                 p.keys.push(config::ProviderKey {
                     key,
                     enabled: true,
-                    rpm,
+                    requests_per_window,
                     owner: String::new(),
                 });
             }
@@ -175,17 +186,17 @@ pub async fn provider_keys(
             KeyAction::Update {
                 index,
                 enabled,
-                rpm,
+                requests_per_window,
                 ..
             } => {
                 let Some(k) = p.keys.get_mut(index) else {
                     return bad_request("no key at that position");
                 };
-                if let Some(rpm) = rpm {
-                    if let Err(e) = check_rpm(rpm) {
+                if let Some(requests_per_window) = requests_per_window {
+                    if let Err(e) = check_requests_per_window(requests_per_window) {
                         return bad_request(&e);
                     }
-                    k.rpm = rpm;
+                    k.requests_per_window = requests_per_window;
                 }
                 if let Some(enabled) = enabled {
                     k.enabled = enabled;
@@ -196,18 +207,28 @@ pub async fn provider_keys(
         // Refuse to leave the proxy with nothing to serve on. Losing the last key
         // takes the data plane down, and doing it by accident from a settings page
         // — one stray disable — is far too easy.
-        if pool::lane_specs(&store).is_empty() {
+        if pool::lane_specs(&store, state.provider_window).is_empty() {
             return bad_request("that would leave no enabled keys and stop the proxy serving");
         }
     }
 
-    finish(&state)
+    finish(&state).await
 }
 
-fn check_rpm(rpm: usize) -> Result<(), String> {
-    match rpm {
-        0 => Err("rpm must be at least 1; disable the key instead".into()),
-        r if r > 10_000 => Err("rpm above 10000 is not a real provider limit".into()),
+fn check_requests_per_window(limit: usize) -> Result<(), String> {
+    match limit {
+        0 => Err("requests_per_window must be at least 1; disable the key instead".into()),
+        r if r > 10_000 => {
+            Err("requests_per_window above 10000 is not a real provider limit".into())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn check_window_secs(window: u64) -> Result<(), String> {
+    match window {
+        0 => Err("window must be at least 1 second".into()),
+        n if n > 86_400 => Err("window above 86400s is not a real provider limit".into()),
         _ => Ok(()),
     }
 }
@@ -219,7 +240,9 @@ pub enum ProviderAction {
         name: String,
         base_url: String,
         key: String,
-        rpm: Option<usize>,
+        #[serde(alias = "rpm")]
+        requests_per_window: Option<usize>,
+        window_secs: Option<u64>,
         /// Which wire protocol this upstream speaks. Omitted means OpenAI, so
         /// existing callers keep working unchanged.
         #[serde(default)]
@@ -231,6 +254,10 @@ pub enum ProviderAction {
     SetBaseUrl {
         name: String,
         base_url: String,
+    },
+    SetWindowSecs {
+        name: String,
+        window_secs: u64,
     },
 }
 
@@ -250,7 +277,8 @@ pub async fn providers(
                 name,
                 base_url,
                 key,
-                rpm,
+                requests_per_window,
+                window_secs,
                 protocol,
             } => {
                 let name = name.trim().to_string();
@@ -264,9 +292,14 @@ pub async fn providers(
                 if store.providers.iter().any(|p| p.name == name) {
                     return bad_request("a provider with that name already exists");
                 }
-                let rpm = rpm.unwrap_or(40);
-                if let Err(e) = check_rpm(rpm) {
+                let requests_per_window = requests_per_window.unwrap_or(40);
+                if let Err(e) = check_requests_per_window(requests_per_window) {
                     return bad_request(&e);
+                }
+                if let Some(window) = window_secs {
+                    if let Err(e) = check_window_secs(window) {
+                        return bad_request(&e);
+                    }
                 }
                 let base_url = config::normalize_base_url(&base_url);
                 if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
@@ -276,10 +309,11 @@ pub async fn providers(
                     name,
                     base_url,
                     protocol,
+                    window_secs,
                     keys: vec![config::ProviderKey {
                         key,
                         enabled: true,
-                        rpm,
+                        requests_per_window,
                         owner: String::new(),
                     }],
                 });
@@ -307,12 +341,21 @@ pub async fn providers(
                 };
                 p.base_url = base_url;
             }
+            ProviderAction::SetWindowSecs { name, window_secs } => {
+                if let Err(e) = check_window_secs(window_secs) {
+                    return bad_request(&e);
+                }
+                let Some(p) = store.providers.iter_mut().find(|p| p.name == name) else {
+                    return bad_request("no provider by that name");
+                };
+                p.window_secs = Some(window_secs);
+            }
         }
-        if pool::lane_specs(&store).is_empty() {
+        if pool::lane_specs(&store, state.provider_window).is_empty() {
             return bad_request("that would leave no enabled keys and stop the proxy serving");
         }
     }
-    finish(&state)
+    finish(&state).await
 }
 
 #[derive(Deserialize)]
@@ -366,7 +409,7 @@ pub async fn aliases(
             }
         }
     }
-    finish(&state)
+    finish(&state).await
 }
 
 /// Turn a persistence outcome into a response. A failed save is the one error
@@ -384,8 +427,8 @@ fn saved(result: Result<(), String>) -> Response {
 }
 
 /// Persist and rebuild the pool, mapping the outcome to a response.
-fn finish(state: &Arc<AppState>) -> Response {
-    saved(apply(state))
+async fn finish(state: &Arc<AppState>) -> Response {
+    saved(apply(state).await)
 }
 
 #[derive(Deserialize)]
@@ -597,9 +640,9 @@ mod tests {
 
     #[test]
     fn rpm_zero_is_rejected_in_favour_of_disabling() {
-        assert!(check_rpm(0).is_err());
-        assert!(check_rpm(1).is_ok());
-        assert!(check_rpm(40).is_ok());
-        assert!(check_rpm(10_001).is_err());
+        assert!(check_requests_per_window(0).is_err());
+        assert!(check_requests_per_window(1).is_ok());
+        assert!(check_requests_per_window(40).is_ok());
+        assert!(check_requests_per_window(10_001).is_err());
     }
 }
